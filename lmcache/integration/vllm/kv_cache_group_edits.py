@@ -164,6 +164,97 @@ def _synthetic_attention_shape(elems_per_page: int, block_size: int) -> tuple[in
     return _SYNTHETIC_NUM_HEADS, elems_per_page // denom
 
 
+def _in_memory_order(kv_cache: torch.Tensor) -> torch.Tensor:
+    """Return a view whose dimensions run outermost-first in memory.
+
+    vLLM exposes rank-4 fused K/V in logical ``(NB, NH, BS, CS)`` order,
+    while NHD storage is physically ``(NB, BS, NH, CS)``.  Sorting dimensions
+    by stride recovers that physical view without copying.  HND is already in
+    memory order and is therefore unchanged.
+    """
+    order = sorted(range(kv_cache.ndim), key=kv_cache.stride, reverse=True)
+    return kv_cache.permute(*order)
+
+
+def _packed_content_size(elems_per_page: int, block_size: int) -> int:
+    """Return the opaque trailing size for one fused-K/V logical page."""
+    denom = block_size * _SYNTHETIC_NUM_HEADS
+    if elems_per_page % denom != 0:
+        raise ValueError(
+            f"page ({elems_per_page} elems) does not factor into "
+            f"(block_size={block_size}, num_heads={_SYNTHETIC_NUM_HEADS}, "
+            "content_size)"
+        )
+    return elems_per_page // denom
+
+
+def _logical_page_ratio_by_bytes(spec: KVCacheSpec, kv_cache: torch.Tensor) -> int:
+    """Return kernel pages per logical page from the byte contract.
+
+    Rank-4 fused K/V has two shape-compatible middle-axis conventions, so
+    locating the token axis from shape alone is unsafe.  The vLLM spec's page
+    byte size is unambiguous and directly determines the ratio.
+    """
+    kernel_page_bytes = kv_cache.shape[1:].numel() * kv_cache.element_size()
+    if kernel_page_bytes <= 0 or spec.page_size_bytes % kernel_page_bytes != 0:
+        raise ValueError(
+            f"kernel page ({kernel_page_bytes} bytes) does not tile the "
+            f"logical page ({spec.page_size_bytes} bytes)"
+        )
+    ratio = spec.page_size_bytes // kernel_page_bytes
+    if ratio <= 1:
+        raise ValueError(
+            f"expected a sub-paged tensor, got logical/kernel byte ratio {ratio}"
+        )
+    if spec.block_size % ratio != 0:
+        raise ValueError(
+            f"logical block size {spec.block_size} is not divisible by "
+            f"the logical/kernel page ratio {ratio}"
+        )
+    kernel_block_size = spec.block_size // ratio
+    middle_axes = tuple(int(size) for size in kv_cache.shape[1:3])
+    declared_heads = getattr(spec, "num_heads", None)
+    if isinstance(declared_heads, int) and declared_heads > 0:
+        possible_kernel_sizes = [
+            middle_axes[1 - axis]
+            for axis, size in enumerate(middle_axes)
+            if size == declared_heads
+        ]
+        if not possible_kernel_sizes:
+            raise ValueError(
+                f"rank-4 middle axes {middle_axes} contain no declared "
+                f"head count {declared_heads}"
+            )
+        if kernel_block_size not in possible_kernel_sizes:
+            raise ValueError(
+                f"byte-derived kernel block size {kernel_block_size} is "
+                f"inconsistent with middle axes {middle_axes} and declared "
+                f"head count {declared_heads}"
+            )
+    elif kernel_block_size not in middle_axes:
+        raise ValueError(
+            f"byte-derived kernel block size {kernel_block_size} is absent "
+            f"from the rank-4 middle axes {middle_axes}"
+        )
+    declared_content_bytes = getattr(spec, "state_content_size_bytes", None)
+    actual_content_bytes = kv_cache.shape[-1] * kv_cache.element_size()
+    if (
+        isinstance(declared_content_bytes, int)
+        and declared_content_bytes > 0
+        and actual_content_bytes != declared_content_bytes
+    ):
+        raise ValueError(
+            f"rank-4 content axis carries {actual_content_bytes} bytes, not "
+            f"the declared {declared_content_bytes} bytes"
+        )
+    if kv_cache.shape[0] % ratio != 0:
+        raise ValueError(
+            f"kernel page count {kv_cache.shape[0]} is not a multiple of "
+            f"the logical/kernel page ratio {ratio}"
+        )
+    return ratio
+
+
 class KVCacheGroupEdit(ABC):
     """One structural edit rule for a KV cache group's registered cache.
 
@@ -495,11 +586,80 @@ class _SubpagedMLAAttentionViewEdit(KVCacheGroupEdit):
         return kv_cache.view(num_kernel_pages // ratio, logical_block_size, -1)
 
 
+class _SubpagedPackedAttentionViewEdit(KVCacheGroupEdit):
+    """Re-view vLLM >= 0.26 fused K/V at logical-block granularity.
+
+    Registered rank-4 tensors have K and V packed in ``CS``.  NHD and HND
+    share the same logical input shape but differ in physical order, so this
+    rule derives the sub-page ratio from bytes, recovers physical memory order,
+    and emits a rank-4 view whose token axis follows ``kv_layout``.  Keeping
+    rank 4 lets the existing detector preserve that layout identity.
+    """
+
+    name = "subpaged-attention-view"
+
+    def matches(self, spec: KVCacheSpec, kv_cache: RegisteredKVCache) -> bool:
+        return (
+            get_kv_cache_spec_kind(spec) in _SUBPAGEABLE_ATTENTION_KINDS
+            and not _declares_slot_compression(spec)
+            and isinstance(kv_cache, torch.Tensor)
+            and kv_cache.ndim == 4
+            and kv_cache.shape[1:].numel() * kv_cache.element_size()
+            != spec.page_size_bytes
+        )
+
+    def apply(
+        self,
+        spec: KVCacheSpec,
+        kv_cache: RegisteredKVCache,
+        layout_hints: LayoutHints,
+    ) -> torch.Tensor:
+        if not isinstance(kv_cache, torch.Tensor) or kv_cache.ndim != 4:
+            got = (
+                tuple(kv_cache.shape)
+                if isinstance(kv_cache, torch.Tensor)
+                else type(kv_cache).__name__
+            )
+            raise ValueError(f"expected a rank-4 fused attention tensor, got {got}")
+
+        kv_layout = layout_hints.get("kv_layout", "none")
+        if kv_layout not in ("NHD", "HND"):
+            raise ValueError(
+                f"Unsupported kv_layout: {kv_layout}. Only NHD and HND are supported."
+            )
+
+        ratio = _logical_page_ratio_by_bytes(spec, kv_cache)
+        ordered = _in_memory_order(kv_cache)
+        if not ordered.is_contiguous() or ordered.shape[0] != kv_cache.shape[0]:
+            raise ValueError(
+                "kernel-paged fused attention tensor must be contiguous with "
+                "the kernel-page count as its outermost memory dimension"
+            )
+
+        num_blocks = kv_cache.shape[0] // ratio
+        elems_per_page = spec.page_size_bytes // kv_cache.element_size()
+        content_size = _packed_content_size(elems_per_page, spec.block_size)
+        if kv_layout == "NHD":
+            return ordered.view(
+                num_blocks,
+                spec.block_size,
+                _SYNTHETIC_NUM_HEADS,
+                content_size,
+            )
+        return ordered.view(
+            num_blocks,
+            _SYNTHETIC_NUM_HEADS,
+            spec.block_size,
+            content_size,
+        )
+
+
 # Rule registry, in match priority order.
 _EDITS: tuple[KVCacheGroupEdit, ...] = (
     _MambaUnifiedViewEdit(),
     _MambaPageViewEdit(),
     _SubpagedMLAAttentionViewEdit(),
+    _SubpagedPackedAttentionViewEdit(),
     _SubpagedAttentionViewEdit(),
 )
 
